@@ -92,15 +92,20 @@ func TestRankWorkflow(t *testing.T) {
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestWorkflowEnvironment()
 	env.RegisterActivity(s.CreateJobActivity)
+	env.RegisterActivity(s.FinalizeJobActivity)
 
 	// Mock the per-sample Gemini call so this stays a pure orchestration test
-	// (no network). Assert the workflow fans out one call per sample.
+	// (no network). It persists each sample as SUCCEEDED, mirroring the real
+	// activity, so FinalizeJobActivity can reconcile from the store.
 	var sampleCalls int
-	env.OnActivity(s.GenerateSampleActivity, mock.Anything, mock.Anything).
-		Return(func(_ context.Context, sample EvertuneSample) (EvertuneSample, error) {
+	env.OnActivity(s.GenerateRankingActivity, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, sample EvertuneSample) (*EvertuneSample, error) {
 			sampleCalls++
 			sample.Status = SampleStatusSucceeded
-			return sample, nil
+			if err := s.jobRepo.UpsertSamples(ctx, []EvertuneSample{sample}); err != nil {
+				return nil, err
+			}
+			return &sample, nil
 		})
 
 	env.ExecuteWorkflow(s.RankWorkflow, wfTemplateID)
@@ -112,10 +117,13 @@ func TestRankWorkflow(t *testing.T) {
 	require.NoError(t, env.GetWorkflowResult(&result))
 	assert.Equal(t, defaultTestWorkflowID, result.JobID)
 	assert.Equal(t, wfTemplateID, result.TemplateID)
-	assert.Equal(t, JobStatusCreated, result.Status)
 
-	// SamplesPerCell=2 with one provider means two fan-out calls.
+	// SamplesPerCell=2 with one provider means two fan-out calls, all succeeding,
+	// so the job completes with both counted.
 	assert.Equal(t, 2, sampleCalls)
+	assert.Equal(t, JobStatusCompleted, result.Status)
+	assert.Equal(t, 2, result.SucceededCount)
+	assert.Equal(t, 0, result.FailedCount)
 
 	stored, err := s.jobRepo.GetRankJob(context.Background(), defaultTestWorkflowID)
 	require.NoError(t, err)

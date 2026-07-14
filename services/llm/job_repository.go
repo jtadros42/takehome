@@ -21,7 +21,6 @@ type JobRepository interface {
 	UpsertSamples(ctx context.Context, samples []EvertuneSample) error
 
 	ListSamplesByJob(ctx context.Context, jobID string) ([]EvertuneSample, error)
-	ListSamplesByBatch(ctx context.Context, batchID string) ([]EvertuneSample, error)
 }
 
 // InMemoryJobRepository is a concurrency-safe, in-process JobRepository for fast
@@ -96,10 +95,6 @@ func (r *InMemoryJobRepository) UpsertSamples(_ context.Context, samples []Evert
 
 func (r *InMemoryJobRepository) ListSamplesByJob(_ context.Context, jobID string) ([]EvertuneSample, error) {
 	return filterValues(r.samples, func(s EvertuneSample) bool { return s.JobID == jobID }), nil
-}
-
-func (r *InMemoryJobRepository) ListSamplesByBatch(_ context.Context, batchID string) ([]EvertuneSample, error) {
-	return filterValues(r.samples, func(s EvertuneSample) bool { return s.BatchID == batchID }), nil
 }
 
 func filterValues[V any](m cmap.ConcurrentMap[string, V], keep func(V) bool) []V {

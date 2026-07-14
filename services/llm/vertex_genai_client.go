@@ -16,20 +16,6 @@ const (
 type VertexGenAIClient struct {
 	client *genai.Client
 }
-type GenerateRequest struct {
-	Prompt          string
-	SystemPrompt    string
-	Model           string
-	MaxOutputTokens int32
-	Temperature     float32
-}
-type GenerateResult struct {
-	Text              string
-	InputTokenCount   int32
-	OutputTokenCount  int32
-	ThoughtTokenCount int32
-	FinishReason      string
-}
 
 func NewVertexAIGeminiClient(ctx context.Context, projectID string, region string) (*VertexGenAIClient, error) {
 	client, err := genai.NewClient(ctx, &genai.ClientConfig{
@@ -78,8 +64,6 @@ func (c *VertexGenAIClient) Generate(ctx context.Context, request GenerateReques
 	return result, nil
 }
 
-// CountTokens returns the token count Vertex computes for the given text under
-// the given model, without generating a response.
 func (c *VertexGenAIClient) CountTokens(ctx context.Context, model string, text string) (int32, error) {
 	resp, err := c.client.Models.CountTokens(ctx, model, genai.Text(text), nil)
 	if err != nil {

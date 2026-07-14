@@ -30,7 +30,7 @@ func main() {
 					Category:       "luxury car brands",
 					Region:         "US",
 					TopN:           10,
-					SamplesPerCell: 1,
+					SamplesPerCell: 10,
 					ModelProviders: []llm.ModelProvider{
 						{
 							Provider: llm.ProviderVertexAI,

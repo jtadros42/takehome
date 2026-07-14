@@ -13,14 +13,11 @@ const (
 	seedTemplateName = "seed luxury tracker"
 	seedJobID        = "seed-job"
 	seedSampleID     = "seed-job-s0"
-	seedBatchID      = "seed-batch"
 	otherJobID       = "job-2"
 
 	sampleID0     = "job-1-s0"
 	sampleID1     = "job-1-s1"
 	otherSampleID = "job-2-s0"
-	sharedBatchID = "batch-47"
-	soloBatchID   = "batch-48"
 )
 
 func getTestInMemoryRepo() *InMemoryJobRepository {
@@ -52,25 +49,21 @@ func getTestInMemoryRepo() *InMemoryJobRepository {
 				JobID:    seedJobID,
 				SampleID: seedSampleID,
 				Provider: ProviderVertexAI,
-				BatchID:  seedBatchID,
 				Status:   SampleStatusPending,
 			},
 			{
 				JobID:    testJobID,
 				SampleID: sampleID0,
-				BatchID:  sharedBatchID,
 				Status:   SampleStatusSubmitted,
 			},
 			{
 				JobID:    testJobID,
 				SampleID: sampleID1,
-				BatchID:  soloBatchID,
 				Status:   SampleStatusSubmitted,
 			},
 			{
 				JobID:    otherJobID,
 				SampleID: otherSampleID,
-				BatchID:  sharedBatchID,
 				Status:   SampleStatusPending,
 			},
 		})
@@ -134,46 +127,6 @@ func TestInMemoryRepo_ListSamplesByJob(t *testing.T) {
 	assert.Empty(t, none)
 }
 
-func TestInMemoryRepo_ListSamplesByBatch(t *testing.T) {
-	testCases := []struct {
-		name           string
-		batchID        string
-		expectedJobIDs []string
-	}{
-		{
-			// The shared batch spans two jobs — the many-to-many the batcher
-			// relies on: this is how it learns whom to signal on completion.
-			name:           "shared batch spans two jobs",
-			batchID:        sharedBatchID,
-			expectedJobIDs: []string{testJobID, otherJobID},
-		},
-		{
-			name:           "solo batch has one job",
-			batchID:        soloBatchID,
-			expectedJobIDs: []string{testJobID},
-		},
-		{
-			name:           "unknown batch is empty",
-			batchID:        "batch-missing",
-			expectedJobIDs: []string{},
-		},
-	}
-
-	repo := getTestInMemoryRepo()
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			samples, err := repo.ListSamplesByBatch(t.Context(), testCase.batchID)
-			require.NoError(t, err)
-
-			jobIDs := make([]string, 0, len(samples))
-			for _, s := range samples {
-				jobIDs = append(jobIDs, s.JobID)
-			}
-			assert.ElementsMatch(t, testCase.expectedJobIDs, jobIDs)
-		})
-	}
-}
-
 func TestInMemoryRepo_SamplesScatterResultBack(t *testing.T) {
 	type expectedSample struct {
 		status       SampleStatus
@@ -187,7 +140,7 @@ func TestInMemoryRepo_SamplesScatterResultBack(t *testing.T) {
 		{
 			name: "one result lands, sibling untouched",
 			scatter: []EvertuneSample{
-				{JobID: testJobID, SampleID: sampleID0, BatchID: sharedBatchID, Status: SampleStatusSucceeded, FinishReason: "STOP"},
+				{JobID: testJobID, SampleID: sampleID0, Status: SampleStatusSucceeded, FinishReason: "STOP"},
 			},
 			expected: map[string]expectedSample{
 				sampleID0: {SampleStatusSucceeded, "STOP"},
@@ -197,8 +150,8 @@ func TestInMemoryRepo_SamplesScatterResultBack(t *testing.T) {
 		{
 			name: "all results land",
 			scatter: []EvertuneSample{
-				{JobID: testJobID, SampleID: sampleID0, BatchID: sharedBatchID, Status: SampleStatusSucceeded, FinishReason: "STOP"},
-				{JobID: testJobID, SampleID: sampleID1, BatchID: soloBatchID, Status: SampleStatusSucceeded, FinishReason: "STOP"},
+				{JobID: testJobID, SampleID: sampleID0, Status: SampleStatusSucceeded, FinishReason: "STOP"},
+				{JobID: testJobID, SampleID: sampleID1, Status: SampleStatusSucceeded, FinishReason: "STOP"},
 			},
 			expected: map[string]expectedSample{
 				sampleID0: {SampleStatusSucceeded, "STOP"},
@@ -208,7 +161,7 @@ func TestInMemoryRepo_SamplesScatterResultBack(t *testing.T) {
 		{
 			name: "a failure lands with its finish reason",
 			scatter: []EvertuneSample{
-				{JobID: testJobID, SampleID: sampleID0, BatchID: sharedBatchID, Status: SampleStatusFailed, FinishReason: "SAFETY"},
+				{JobID: testJobID, SampleID: sampleID0, Status: SampleStatusFailed, FinishReason: "SAFETY"},
 			},
 			expected: map[string]expectedSample{
 				sampleID0: {SampleStatusFailed, "SAFETY"},
@@ -252,8 +205,6 @@ func BenchmarkDeepCopySample(b *testing.B) {
 		SampleID:      "job-1-p0-s0",
 		Provider:      ProviderVertexAI,
 		Model:         "gemini-2.5-flash-002",
-		BatchID:       "batch-47",
-		ExternalJobID: "vertex-123",
 		Status:        SampleStatusSucceeded,
 		FinishReason:  "STOP",
 		ResultURI:     "gs://bucket/job-1/s0.json",

@@ -3,6 +3,7 @@ package llm
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -70,34 +71,56 @@ type EvertuneJobTemplate struct {
 // a correlation id to track the lifecycle of a job through various
 // workflows
 type EvertuneRankJob struct {
-	JobID       string    `json:"job_id"`
-	TemplateID  string    `json:"template_id"`
-	Status      JobStatus `json:"status"`
-	SampleCount int       `json:"sample_count"`
-	ReportURI   string    `json:"report_uri,omitempty"`
-	Error       string    `json:"error,omitempty"`
-	RequestedAt time.Time `json:"requested_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	JobID          string         `json:"job_id"`
+	TemplateID     string         `json:"template_id"`
+	Status         JobStatus      `json:"status"`
+	SampleCount    int            `json:"sample_count"`
+	SucceededCount int            `json:"succeeded_count"`
+	FailedCount    int            `json:"failed_count"`
+	Ranking        []ModelRanking `json:"ranking,omitempty"`
+	ReportURI      string         `json:"report_uri,omitempty"`
+	Error          string         `json:"error,omitempty"`
+	RequestedAt    time.Time      `json:"requested_at"`
+	UpdatedAt      time.Time      `json:"updated_at"`
 }
 
 type EvertuneSample struct {
-	JobID         string         `json:"job_id"`
-	SampleID      string         `json:"sample_id"`
-	Provider      Provider       `json:"provider"`
-	Model         SupportedModel `json:"model"`
-	BatchID       string         `json:"batch_id,omitempty"`
-	ExternalJobID string         `json:"external_job_id,omitempty"`
-	Status        SampleStatus   `json:"status"`
-	ResultURI     string         `json:"result_uri,omitempty"`
-	RawResponse   string         `json:"raw_response,omitempty"`
-	FinishReason  string         `json:"finish_reason,omitempty"`
-	InputTokens   int32          `json:"input_tokens,omitempty"`
-	OutputTokens  int32          `json:"output_tokens,omitempty"`
-	CreatedAt     time.Time      `json:"created_at"`
-	UpdatedAt     time.Time      `json:"updated_at"`
-	CompletedAt   time.Time      `json:"completed_at,omitzero"`
+	JobID        string         `json:"job_id"`
+	SampleID     string         `json:"sample_id"`
+	Provider     Provider       `json:"provider"`
+	Model        SupportedModel `json:"model"`
+	Status       SampleStatus   `json:"status"`
+	ResultURI    string         `json:"result_uri,omitempty"`
+	RawResponse  string         `json:"raw_response,omitempty"`
+	FinishReason string         `json:"finish_reason,omitempty"`
+	InputTokens  int32          `json:"input_tokens,omitempty"`
+	OutputTokens int32          `json:"output_tokens,omitempty"`
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    time.Time      `json:"updated_at"`
+	CompletedAt  time.Time      `json:"completed_at,omitzero"`
 }
 
+func (s *EvertuneSample) populateFromResponse(response *GenerateResult) {
+	s.RawResponse = response.Text
+	s.FinishReason = response.FinishReason
+	s.InputTokens = response.InputTokenCount
+	s.OutputTokens = response.OutputTokenCount
+}
+
+type GenerateRequest struct {
+	Prompt          string
+	SystemPrompt    string
+	Model           string
+	MaxOutputTokens int32
+	Temperature     float32
+}
+type GenerateResult struct {
+	Text              string
+	InputTokenCount   int32
+	OutputTokenCount  int32
+	ThoughtTokenCount int32
+	FinishReason      string
+}
 type RankRequest struct {
 	Category string `json:"category"`
 	Region   string `json:"region,omitempty"`
@@ -123,6 +146,95 @@ func parseRankResponse(body []byte) (RankResponse, error) {
 		return RankResponse{}, err
 	}
 	return ranking, nil
+}
+
+// BrandStat is one brand's aggregated standing across a job's samples: its mean
+// rank (lower is stronger) and how many samples ranked it.
+type BrandStat struct {
+	Brand       string  `json:"brand"`
+	MeanRank    float64 `json:"mean_rank"`
+	SampleCount int     `json:"sample_count"`
+}
+
+// ModelRanking is one model's consensus ranking, so results are attributable to
+// the LLM that produced them and can be compared across providers.
+type ModelRanking struct {
+	Provider Provider       `json:"provider"`
+	Model    SupportedModel `json:"model"`
+	Brands   []BrandStat    `json:"brands"`
+}
+
+// AggregateRanking folds a job's succeeded samples into one consensus ranking
+// per (provider, model): for each brand, the mean of the ranks it received and
+// the number of samples that ranked it. Each model's brands are sorted by mean
+// rank ascending (strongest first); models are ordered by provider then model.
+// Samples whose raw response no longer parses are skipped.
+func AggregateRanking(samples []EvertuneSample) []ModelRanking {
+	type modelKey struct {
+		provider Provider
+		model    SupportedModel
+	}
+	type accum struct {
+		rankSum float64
+		count   int
+	}
+	byModel := map[modelKey]map[string]*accum{}
+	for _, sample := range samples {
+		if sample.Status != SampleStatusSucceeded {
+			continue
+		}
+		resp, err := parseRankResponse([]byte(sample.RawResponse))
+		if err != nil {
+			continue
+		}
+		key := modelKey{provider: sample.Provider, model: sample.Model}
+		byBrand := byModel[key]
+		if byBrand == nil {
+			byBrand = map[string]*accum{}
+			byModel[key] = byBrand
+		}
+		for _, r := range resp.Rankings {
+			a := byBrand[r.Brand]
+			if a == nil {
+				a = &accum{}
+				byBrand[r.Brand] = a
+			}
+			a.rankSum += float64(r.Rank)
+			a.count++
+		}
+	}
+
+	rankings := make([]ModelRanking, 0, len(byModel))
+	for key, byBrand := range byModel {
+		brands := make([]BrandStat, 0, len(byBrand))
+		for brand, a := range byBrand {
+			brands = append(brands, BrandStat{
+				Brand:       brand,
+				MeanRank:    a.rankSum / float64(a.count),
+				SampleCount: a.count,
+			})
+		}
+		// Strongest (lowest mean rank) first; break ties by brand for stability.
+		sort.Slice(brands, func(i, j int) bool {
+			if brands[i].MeanRank != brands[j].MeanRank {
+				return brands[i].MeanRank < brands[j].MeanRank
+			}
+			return brands[i].Brand < brands[j].Brand
+		})
+		rankings = append(rankings, ModelRanking{
+			Provider: key.provider,
+			Model:    key.model,
+			Brands:   brands,
+		})
+	}
+	// Deterministic model order.
+	sort.Slice(rankings, func(i, j int) bool {
+		if rankings[i].Provider != rankings[j].Provider {
+			return rankings[i].Provider < rankings[j].Provider
+		}
+		return rankings[i].Model < rankings[j].Model
+	})
+	return rankings
 }
 
 // ExpandTemplate instantiates a Job and its Samples given a template.

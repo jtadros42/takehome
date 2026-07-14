@@ -7,11 +7,17 @@ import (
 	"time"
 
 	"github.com/jtadros42/takehome/services/llm/resources"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
 
-// CreateJobResult is what CreateJobActivity hands back to the workflow: the
-// persisted job plus the samples to fan out over.
+const (
+	maxConcurrentSamples = 10
+	maxParseAttempts     = 5
+	parseErrorType       = "ParseError"
+	maxFailureRate       = 0.10
+)
+
 type CreateJobResult struct {
 	Job     EvertuneRankJob  `json:"job"`
 	Samples []EvertuneSample `json:"samples"`
@@ -20,12 +26,17 @@ type CreateJobResult struct {
 func (s *Service) RankWorkflow(ctx workflow.Context, templateID string) (*EvertuneRankJob, error) {
 	ctx = workflow.WithActivityOptions(ctx,
 		workflow.ActivityOptions{
-			StartToCloseTimeout: 30 * time.Second,
+			StartToCloseTimeout:    30 * time.Second,
+			ScheduleToCloseTimeout: 2 * time.Hour,
+			RetryPolicy: &temporal.RetryPolicy{
+				InitialInterval:    time.Second,
+				BackoffCoefficient: 2.0,
+				MaximumInterval:    time.Minute,
+				MaximumAttempts:    0,
+			},
 		},
 	)
 	jobID := workflow.GetInfo(ctx).WorkflowExecution.ID
-
-	// Create + persist the job, tasks, and samples; get back the samples to run.
 	var created CreateJobResult
 	if err := workflow.ExecuteActivity(
 		ctx,
@@ -37,24 +48,37 @@ func (s *Service) RankWorkflow(ctx workflow.Context, templateID string) (*Evertu
 		return nil, err
 	}
 
-	// Fan out: dispatch one Gemini call per sample, all in flight at once.
-	futures := make([]workflow.Future, 0, len(created.Samples))
+	sem := workflow.NewBufferedChannel(ctx, maxConcurrentSamples)
+	done := workflow.NewChannel(ctx)
+
+	// Fan out one Gemini call per sample, bounded to maxConcurrentSamples.
 	for _, sample := range created.Samples {
-		futures = append(futures, workflow.ExecuteActivity(ctx, s.GenerateSampleActivity, sample))
+		sample := sample
+		sem.Send(ctx, nil)
+		workflow.Go(ctx, func(ctx workflow.Context) {
+			defer func() {
+				sem.Receive(ctx, nil)
+				done.Send(ctx, nil)
+			}()
+			_ = workflow.ExecuteActivity(ctx, s.GenerateRankingActivity, sample).Get(ctx, nil)
+		})
 	}
 
-	// Drain every future before returning so no sample is left racing the exit.
-	var firstErr error
-	for _, f := range futures {
-		if err := f.Get(ctx, nil); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	if firstErr != nil {
-		return nil, firstErr
+	// Wait for every spawned coroutine before reconciling.
+	for range created.Samples {
+		done.Receive(ctx, nil)
 	}
 
-	return &created.Job, nil
+	// Tally the persisted sample outcomes into the job's final status + counts.
+	var job EvertuneRankJob
+	if err := workflow.ExecuteActivity(
+		ctx,
+		s.FinalizeJobActivity,
+		jobID,
+	).Get(ctx, &job); err != nil {
+		return nil, err
+	}
+	return &job, nil
 }
 
 func (s *Service) CreateJobActivity(ctx context.Context, templateID, jobID string, runTime time.Time) (*CreateJobResult, error) {
@@ -68,30 +92,110 @@ func (s *Service) CreateJobActivity(ctx context.Context, templateID, jobID strin
 		runTime,
 	)
 	if err := s.jobRepo.UpsertRankJob(ctx, job); err != nil {
-		return nil, fmt.Errorf("upserting job: %w", err)
+		return nil, err
 	}
 	if err := s.jobRepo.UpsertSamples(ctx, samples); err != nil {
-		return nil, fmt.Errorf("upserting samples: %w", err)
+		return nil, err
 	}
-	return &CreateJobResult{Job: job, Samples: samples}, nil
+	return &CreateJobResult{
+		Job:     job,
+		Samples: samples,
+	}, nil
 }
 
-// GenerateSampleActivity performs one synchronous Gemini call for a single
-// sample: it builds the ranking prompt from the job's template, calls the
-// model, parses the response, and persists the outcome onto the sample.
-func (s *Service) GenerateSampleActivity(ctx context.Context, sample EvertuneSample) (EvertuneSample, error) {
+func (s *Service) GenerateRankingActivity(ctx context.Context, sample EvertuneSample) (*EvertuneSample, error) {
+	request, err := s.buildSampleRequest(ctx, sample)
+	if err != nil {
+		return nil, err
+	}
+
+	// Re-roll on unparseable responses up to maxParseAttempts. A real API error
+	// (e.g. a 429) returns immediately so Temporal's RetryPolicy handles it with
+	// backoff
+	var response *GenerateResult
+	var parseErr error
+	for range maxParseAttempts {
+		response, err = s.genAiClient.Generate(ctx, *request)
+		if err != nil {
+			return nil, fmt.Errorf("gemini generate: %w", err)
+		}
+		if _, parseErr = parseRankResponse([]byte(response.Text)); parseErr == nil {
+			break
+		}
+	}
+
+	if parseErr == nil {
+		sample.Status = SampleStatusSucceeded
+	} else {
+		sample.Status = SampleStatusFailed
+	}
+
+	sample.populateFromResponse(response)
+	sample.CompletedAt = time.Now().UTC()
+	sample.UpdatedAt = sample.CompletedAt
+
+	if err := s.jobRepo.UpsertSamples(ctx, []EvertuneSample{sample}); err != nil {
+		return nil, fmt.Errorf("upserting sample: %w", err)
+	}
+
+	if parseErr != nil {
+		// Every re-roll failed to parse; stop (terminal — no Temporal retry).
+		return nil, temporal.NewNonRetryableApplicationError(
+			"unparseable rank response", parseErrorType, parseErr,
+		)
+	}
+	return &sample, nil
+}
+
+func (s *Service) FinalizeJobActivity(ctx context.Context, jobID string) (*EvertuneRankJob, error) {
+	job, err := s.jobRepo.GetRankJob(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("getting job %q: %w", jobID, err)
+	}
+	samples, err := s.jobRepo.ListSamplesByJob(ctx, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("listing samples for job %q: %w", jobID, err)
+	}
+
+	var succeeded, failed int
+	for _, sample := range samples {
+		switch sample.Status {
+		case SampleStatusSucceeded:
+			succeeded++
+		case SampleStatusFailed:
+			failed++
+		}
+	}
+
+	job.SucceededCount = succeeded
+	job.FailedCount = failed
+	job.Ranking = AggregateRanking(samples)
+	job.Status = JobStatusCompleted
+
+	total := succeeded + failed
+	if total > 0 && float64(failed)/float64(total) >= maxFailureRate {
+		job.Status = JobStatusFailed
+	}
+
+	job.UpdatedAt = time.Now().UTC()
+	if err := s.jobRepo.UpsertRankJob(ctx, job); err != nil {
+		return nil, fmt.Errorf("upserting completed job: %w", err)
+	}
+	return &job, nil
+}
+
+func (s *Service) buildSampleRequest(ctx context.Context, sample EvertuneSample) (*GenerateRequest, error) {
 	job, err := s.jobRepo.GetRankJob(ctx, sample.JobID)
 	if err != nil {
-		return EvertuneSample{}, fmt.Errorf("getting job %q: %w", sample.JobID, err)
+		return nil, fmt.Errorf("getting job %q: %w", sample.JobID, err)
 	}
 	tmpl, err := s.jobRepo.GetJobTemplate(ctx, job.TemplateID)
 	if err != nil {
-		return EvertuneSample{}, fmt.Errorf("getting template %q: %w", job.TemplateID, err)
+		return nil, fmt.Errorf("getting template %q: %w", job.TemplateID, err)
 	}
-
 	systemPrompt, err := resources.SystemPrompt("ranker")
 	if err != nil {
-		return EvertuneSample{}, fmt.Errorf("loading ranker prompt: %w", err)
+		return nil, fmt.Errorf("loading ranker prompt: %w", err)
 	}
 	userPrompt, err := json.Marshal(RankRequest{
 		Category: tmpl.Category,
@@ -99,38 +203,11 @@ func (s *Service) GenerateSampleActivity(ctx context.Context, sample EvertuneSam
 		TopN:     tmpl.TopN,
 	})
 	if err != nil {
-		return EvertuneSample{}, fmt.Errorf("marshaling rank request: %w", err)
+		return nil, fmt.Errorf("marshaling rank request: %w", err)
 	}
-
-	result, err := s.genAiClient.Generate(ctx, GenerateRequest{
+	return &GenerateRequest{
 		Prompt:       string(userPrompt),
 		SystemPrompt: systemPrompt,
 		Model:        string(sample.Model),
-	})
-	if err != nil {
-		return EvertuneSample{}, fmt.Errorf("gemini generate: %w", err)
-	}
-
-	sample.RawResponse = result.Text
-	sample.FinishReason = result.FinishReason
-	sample.InputTokens = result.InputTokenCount
-	sample.OutputTokens = result.OutputTokenCount
-	sample.CompletedAt = time.Now().UTC()
-	sample.UpdatedAt = sample.CompletedAt
-
-	// A response that doesn't parse into the ranking shape is a failed sample,
-	// not a failed activity: we keep the raw text for inspection and record it.
-	if _, err := parseRankResponse([]byte(result.Text)); err != nil {
-		sample.Status = SampleStatusFailed
-		if uerr := s.jobRepo.UpsertSamples(ctx, []EvertuneSample{sample}); uerr != nil {
-			return EvertuneSample{}, fmt.Errorf("upserting failed sample: %w", uerr)
-		}
-		return sample, nil
-	}
-
-	sample.Status = SampleStatusSucceeded
-	if err := s.jobRepo.UpsertSamples(ctx, []EvertuneSample{sample}); err != nil {
-		return EvertuneSample{}, fmt.Errorf("upserting sample: %w", err)
-	}
-	return sample, nil
+	}, nil
 }
