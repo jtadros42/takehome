@@ -11,7 +11,7 @@ import (
 
 func TestJobStatus_Values(t *testing.T) {
 	assert.Equal(t, "CREATED", string(JobStatusCreated))
-	assert.Equal(t, "REPORT_READY", string(JobStatusReportReady))
+	assert.Equal(t, "COMPLETED", string(JobStatusCompleted))
 	assert.Equal(t, "FAILED", string(JobStatusFailed))
 	assert.Equal(t, "SUCCEEDED", string(SampleStatusSucceeded))
 }

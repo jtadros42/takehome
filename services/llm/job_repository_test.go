@@ -54,12 +54,12 @@ func getTestInMemoryRepo() *InMemoryJobRepository {
 			{
 				JobID:    testJobID,
 				SampleID: sampleID0,
-				Status:   SampleStatusSubmitted,
+				Status:   SampleStatusPending,
 			},
 			{
 				JobID:    testJobID,
 				SampleID: sampleID1,
-				Status:   SampleStatusSubmitted,
+				Status:   SampleStatusPending,
 			},
 			{
 				JobID:    otherJobID,
@@ -89,10 +89,10 @@ func TestInMemoryRepo_RankJob(t *testing.T) {
 	assert.Equal(t, JobStatusCreated, got.Status)
 
 	// Upsert with the same JobID overwrites
-	require.NoError(t, repo.UpsertRankJob(ctx, EvertuneRankJob{JobID: testJobID, Status: JobStatusPolling}))
+	require.NoError(t, repo.UpsertRankJob(ctx, EvertuneRankJob{JobID: testJobID, Status: JobStatusCompleted}))
 	got, err = repo.GetRankJob(ctx, testJobID)
 	require.NoError(t, err)
-	assert.Equal(t, JobStatusPolling, got.Status)
+	assert.Equal(t, JobStatusCompleted, got.Status)
 }
 
 func TestInMemoryRepo_ReturnedValueIsACopy(t *testing.T) {
@@ -127,7 +127,7 @@ func TestInMemoryRepo_ListSamplesByJob(t *testing.T) {
 	assert.Empty(t, none)
 }
 
-func TestInMemoryRepo_SamplesScatterResultBack(t *testing.T) {
+func TestInMemoryRepo_UpsertSamplesOverwritesInPlace(t *testing.T) {
 	type expectedSample struct {
 		status       SampleStatus
 		finishReason string
@@ -144,7 +144,7 @@ func TestInMemoryRepo_SamplesScatterResultBack(t *testing.T) {
 			},
 			expected: map[string]expectedSample{
 				sampleID0: {SampleStatusSucceeded, "STOP"},
-				sampleID1: {SampleStatusSubmitted, ""},
+				sampleID1: {SampleStatusPending, ""},
 			},
 		},
 		{
@@ -165,7 +165,7 @@ func TestInMemoryRepo_SamplesScatterResultBack(t *testing.T) {
 			},
 			expected: map[string]expectedSample{
 				sampleID0: {SampleStatusFailed, "SAFETY"},
-				sampleID1: {SampleStatusSubmitted, ""},
+				sampleID1: {SampleStatusPending, ""},
 			},
 		},
 	}
@@ -201,18 +201,17 @@ func TestInMemoryRepo_EmptyUpsertsAreNoOps(t *testing.T) {
 
 func BenchmarkDeepCopySample(b *testing.B) {
 	sample := EvertuneSample{
-		JobID:         "job-1",
-		SampleID:      "job-1-p0-s0",
-		Provider:      ProviderVertexAI,
-		Model:         "gemini-2.5-flash-002",
-		Status:        SampleStatusSucceeded,
-		FinishReason:  "STOP",
-		ResultURI:     "gs://bucket/job-1/s0.json",
-		InputTokens:   662,
-		OutputTokens:  197,
-		CreatedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
-		CompletedAt:   time.Now(),
+		JobID:        "job-1",
+		SampleID:     "job-1-p0-s0",
+		Provider:     ProviderVertexAI,
+		Model:        "gemini-2.5-flash-002",
+		Status:       SampleStatusSucceeded,
+		FinishReason: "STOP",
+		InputTokens:  662,
+		OutputTokens: 197,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+		CompletedAt:  time.Now(),
 	}
 
 	b.ReportAllocs()

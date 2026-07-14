@@ -23,7 +23,6 @@ type Service struct {
 	env            EnvConfig
 	genAiClient    VertexAIClient
 	temporalClient client.Client
-	httpServer     *http.Server
 }
 
 func NewService(ctx context.Context, env EnvConfig, repo JobRepository) (*Service, error) {
@@ -47,7 +46,7 @@ func NewService(ctx context.Context, env EnvConfig, repo JobRepository) (*Servic
 
 func (s *Service) Run(ctx context.Context) error {
 	w := s.createTemporalWorker()
-	httpServer := createHttpServer(s)
+	httpServer := s.createHttpServer()
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		if err := httpServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
@@ -78,12 +77,11 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 func (s *Service) createTemporalWorker() worker.Worker {
-	w := worker.New(s.temporalClient, RankerTaskQueue, worker.Options{
-		// Cap concurrent activity executions across all workflows on this worker.
-		// This is the global throttle for live Gemini calls; scale by raising it
-		// (up to Vertex quota) or by adding workers.
-		MaxConcurrentActivityExecutionSize: 50,
-	})
+	w := worker.New(s.temporalClient, RankerTaskQueue,
+		worker.Options{
+			MaxConcurrentActivityExecutionSize: 50,
+		},
+	)
 	w.RegisterWorkflow(s.RankWorkflow)
 	w.RegisterActivity(s.CreateJobActivity)
 	w.RegisterActivity(s.GenerateRankingActivity)
@@ -91,11 +89,11 @@ func (s *Service) createTemporalWorker() worker.Worker {
 	return w
 }
 
-func createHttpServer(s *Service) *http.Server {
+func (s *Service) createHttpServer() *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.Health)
 	mux.HandleFunc("/ready", s.Ready)
-	mux.HandleFunc("/workflow/run/", s.RunWorkflow)
+	mux.HandleFunc("POST /workflow/run", s.RunWorkflow)
 	return &http.Server{
 		Addr:    fmt.Sprintf("[::]:%d", s.env.HttpPort),
 		Handler: mux,

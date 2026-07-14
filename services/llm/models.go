@@ -10,24 +10,16 @@ import (
 type JobStatus string
 
 const (
-	JobStatusCreated     JobStatus = "CREATED"
-	JobStatusStaged      JobStatus = "STAGED"
-	JobStatusSubmitted   JobStatus = "SUBMITTED"
-	JobStatusPolling     JobStatus = "POLLING"
-	JobStatusFetching    JobStatus = "FETCHING"
-	JobStatusAggregating JobStatus = "AGGREGATING"
-	JobStatusCompleted   JobStatus = "COMPLETED"
-	JobStatusReportReady JobStatus = "REPORT_READY"
-	JobStatusFailed      JobStatus = "FAILED"
+	JobStatusCreated   JobStatus = "CREATED"
+	JobStatusCompleted JobStatus = "COMPLETED"
+	JobStatusFailed    JobStatus = "FAILED"
 )
 
-// SampleStatus tracks one individual LLM call through a batch.
+// SampleStatus tracks one individual LLM call.
 type SampleStatus string
 
 const (
 	SampleStatusPending   SampleStatus = "PENDING"
-	SampleStatusStaged    SampleStatus = "STAGED"
-	SampleStatusSubmitted SampleStatus = "SUBMITTED"
 	SampleStatusSucceeded SampleStatus = "SUCCEEDED"
 	SampleStatusFailed    SampleStatus = "FAILED"
 )
@@ -90,7 +82,6 @@ type EvertuneSample struct {
 	Provider     Provider       `json:"provider"`
 	Model        SupportedModel `json:"model"`
 	Status       SampleStatus   `json:"status"`
-	ResultURI    string         `json:"result_uri,omitempty"`
 	RawResponse  string         `json:"raw_response,omitempty"`
 	FinishReason string         `json:"finish_reason,omitempty"`
 	InputTokens  int32          `json:"input_tokens,omitempty"`
@@ -164,79 +155,6 @@ type ModelRanking struct {
 	Brands   []BrandStat    `json:"brands"`
 }
 
-// AggregateRanking folds a job's succeeded samples into one consensus ranking
-// per (provider, model): for each brand, the mean of the ranks it received and
-// the number of samples that ranked it. Each model's brands are sorted by mean
-// rank ascending (strongest first); models are ordered by provider then model.
-// Samples whose raw response no longer parses are skipped.
-func AggregateRanking(samples []EvertuneSample) []ModelRanking {
-	type modelKey struct {
-		provider Provider
-		model    SupportedModel
-	}
-	type accum struct {
-		rankSum float64
-		count   int
-	}
-	byModel := map[modelKey]map[string]*accum{}
-	for _, sample := range samples {
-		if sample.Status != SampleStatusSucceeded {
-			continue
-		}
-		resp, err := parseRankResponse([]byte(sample.RawResponse))
-		if err != nil {
-			continue
-		}
-		key := modelKey{provider: sample.Provider, model: sample.Model}
-		byBrand := byModel[key]
-		if byBrand == nil {
-			byBrand = map[string]*accum{}
-			byModel[key] = byBrand
-		}
-		for _, r := range resp.Rankings {
-			a := byBrand[r.Brand]
-			if a == nil {
-				a = &accum{}
-				byBrand[r.Brand] = a
-			}
-			a.rankSum += float64(r.Rank)
-			a.count++
-		}
-	}
-
-	rankings := make([]ModelRanking, 0, len(byModel))
-	for key, byBrand := range byModel {
-		brands := make([]BrandStat, 0, len(byBrand))
-		for brand, a := range byBrand {
-			brands = append(brands, BrandStat{
-				Brand:       brand,
-				MeanRank:    a.rankSum / float64(a.count),
-				SampleCount: a.count,
-			})
-		}
-		// Strongest (lowest mean rank) first; break ties by brand for stability.
-		sort.Slice(brands, func(i, j int) bool {
-			if brands[i].MeanRank != brands[j].MeanRank {
-				return brands[i].MeanRank < brands[j].MeanRank
-			}
-			return brands[i].Brand < brands[j].Brand
-		})
-		rankings = append(rankings, ModelRanking{
-			Provider: key.provider,
-			Model:    key.model,
-			Brands:   brands,
-		})
-	}
-	// Deterministic model order.
-	sort.Slice(rankings, func(i, j int) bool {
-		if rankings[i].Provider != rankings[j].Provider {
-			return rankings[i].Provider < rankings[j].Provider
-		}
-		return rankings[i].Model < rankings[j].Model
-	})
-	return rankings
-}
-
 // ExpandTemplate instantiates a Job and its Samples given a template.
 func ExpandTemplate(tmpl *EvertuneJobTemplate, jobID string, now time.Time) (EvertuneRankJob, []EvertuneSample) {
 	samples := make([]EvertuneSample, 0, len(tmpl.ModelProviders)*tmpl.SamplesPerCell)
@@ -264,6 +182,79 @@ func ExpandTemplate(tmpl *EvertuneJobTemplate, jobID string, now time.Time) (Eve
 		UpdatedAt:   now,
 	}
 	return job, samples
+}
+
+// AggregateRanking produces a sorted list of rankings per (provider, model)
+func AggregateRanking(samples []EvertuneSample) []ModelRanking {
+	type modelKey struct {
+		provider Provider
+		model    SupportedModel
+	}
+	byModel := map[modelKey][]RankResponse{}
+	for _, sample := range samples {
+		if sample.Status != SampleStatusSucceeded {
+			continue
+		}
+		resp, err := parseRankResponse([]byte(sample.RawResponse))
+		if err != nil {
+			continue
+		}
+		key := modelKey{sample.Provider, sample.Model}
+		byModel[key] = append(byModel[key], resp)
+	}
+
+	rankings := make([]ModelRanking, 0, len(byModel))
+	for key, responses := range byModel {
+		rankings = append(rankings, ModelRanking{
+			Provider: key.provider,
+			Model:    key.model,
+			Brands:   aggregateBrands(responses),
+		})
+	}
+	// Deterministic model order.
+	sort.Slice(rankings, func(i, j int) bool {
+		if rankings[i].Provider != rankings[j].Provider {
+			return rankings[i].Provider < rankings[j].Provider
+		}
+		return rankings[i].Model < rankings[j].Model
+	})
+	return rankings
+}
+
+// aggregateBrands folds one model's ranking responses into per-brand mean rank and sample count
+func aggregateBrands(responses []RankResponse) []BrandStat {
+	type accum struct {
+		rankSum float64
+		count   int
+	}
+	byBrand := map[string]*accum{}
+	for _, resp := range responses {
+		for _, r := range resp.Rankings {
+			a := byBrand[r.Brand]
+			if a == nil {
+				a = &accum{}
+				byBrand[r.Brand] = a
+			}
+			a.rankSum += float64(r.Rank)
+			a.count++
+		}
+	}
+
+	brands := make([]BrandStat, 0, len(byBrand))
+	for brand, a := range byBrand {
+		brands = append(brands, BrandStat{
+			Brand:       brand,
+			MeanRank:    a.rankSum / float64(a.count),
+			SampleCount: a.count,
+		})
+	}
+	sort.Slice(brands, func(i, j int) bool {
+		if brands[i].MeanRank != brands[j].MeanRank {
+			return brands[i].MeanRank < brands[j].MeanRank
+		}
+		return brands[i].Brand < brands[j].Brand
+	})
+	return brands
 }
 
 func SampleIDFor(jobID string, providerIndex, sampleIndex int) string {
