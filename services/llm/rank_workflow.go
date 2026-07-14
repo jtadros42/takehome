@@ -36,6 +36,12 @@ type CreateJobResult struct {
 }
 
 func (s *Service) RankWorkflow(ctx workflow.Context, templateID string) (*EvertuneRankJob, error) {
+	// The intention of this configuration is to allow 429s to retry
+	// for an extended period of time once tokens/request quota is exhausted
+	// It will retry until the ScheduleToCloseTimeout is reached (default 2 hours)
+	// Non retryable errors will fail immediately. Other errors, like invalid
+	// response format from the LLM, will retry up to a maxAttempts and fail. These
+	// retries are handled in the activity
 	ctx = workflow.WithActivityOptions(ctx,
 		workflow.ActivityOptions{
 			StartToCloseTimeout:    30 * time.Second,
