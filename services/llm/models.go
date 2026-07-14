@@ -42,11 +42,9 @@ type ModelProvider struct {
 	Model    SupportedModel `json:"model"`
 }
 
-// EvertuneJobTemplate is an abstract definition of one category to track sentiment
-// over and which LLMs to compare. One template = one tracked category; the report
-// compares how each provider ranks brands within it.
-// This will most likely contain a schedule to run the report on a cadence, but for
-// the purpose of this assignment you have to explicitly invoke it.
+// EvertuneJobTemplate defines one category to track and which LLMs to compare.
+// One template = one tracked category; a ranking job instantiated from it
+// compares how each provider ranks brands within that category.
 type EvertuneJobTemplate struct {
 	TemplateID     string          `json:"template_id"`
 	Name           string          `json:"name"`
@@ -70,7 +68,6 @@ type EvertuneRankJob struct {
 	SucceededCount int            `json:"succeeded_count"`
 	FailedCount    int            `json:"failed_count"`
 	Ranking        []ModelRanking `json:"ranking,omitempty"`
-	ReportURI      string         `json:"report_uri,omitempty"`
 	Error          string         `json:"error,omitempty"`
 	RequestedAt    time.Time      `json:"requested_at"`
 	UpdatedAt      time.Time      `json:"updated_at"`
