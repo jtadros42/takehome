@@ -112,66 +112,11 @@ services:
         condition: service_healthy
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
-      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
     image: temporalio/ui:2.52.0
     networks:
       - temporal-network
     ports:
       - 8080:8080
-
-  tempo:
-    container_name: tempo
-    image: grafana/tempo:2.8.2
-    command: [ "-config.file=/etc/tempo.yaml" ]
-    volumes:
-      - ./config/observability/tempo.yaml:/etc/tempo.yaml
-      # mount at /var/tempo: the image ships it owned by the tempo user
-      # (10001), so the volume inherits writable ownership on first create
-      - tempo-data:/var/tempo
-    ports:
-      - "3200:3200"   # Tempo query frontend
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP
-    networks:
-      - temporal-network
-
-  prometheus:
-    container_name: prometheus
-    image: prom/prometheus:latest
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.enable-remote-write-receiver'
-    volumes:
-      - ./config/observability/prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus-data:/prometheus
-    ports:
-      - "9090:9090"
-    networks:
-      - temporal-network
-
-  grafana:
-    container_name: grafana
-    image: grafana/grafana:latest
-    environment:
-      - GF_AUTH_ANONYMOUS_ENABLED=true
-      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
-      - GF_AUTH_DISABLE_LOGIN_FORM=true
-    volumes:
-      - ./config/observability/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
-      - grafana-data:/var/lib/grafana
-    ports:
-      - "3000:3000"
-    depends_on:
-      - prometheus
-      - tempo
-    networks:
-      - temporal-network
-
-volumes:
-  tempo-data:
-  prometheus-data:
-  grafana-data:
 
 networks:
   temporal-network:
