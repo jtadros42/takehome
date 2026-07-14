@@ -21,7 +21,7 @@ const (
 type Service struct {
 	jobRepo        JobRepository
 	env            EnvConfig
-	genAiClient    *VertexGenAIClient
+	genAiClient    VertexAIClient
 	temporalClient client.Client
 	httpServer     *http.Server
 }

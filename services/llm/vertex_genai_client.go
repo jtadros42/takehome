@@ -17,6 +17,12 @@ type VertexGenAIClient struct {
 	client *genai.Client
 }
 
+// VertexAIClient interface is defined for mocking/testing retry behavior
+type VertexAIClient interface {
+	Generate(ctx context.Context, request GenerateRequest) (*GenerateResult, error)
+	CountTokens(ctx context.Context, model string, text string) (int32, error)
+}
+
 func NewVertexAIGeminiClient(ctx context.Context, projectID string, region string) (*VertexGenAIClient, error) {
 	client, err := genai.NewClient(ctx, &genai.ClientConfig{
 		Backend:  genai.BackendVertexAI,

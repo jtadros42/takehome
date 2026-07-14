@@ -3,20 +3,32 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/jtadros42/takehome/services/llm/resources"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
+	"google.golang.org/genai"
 )
 
 const (
 	maxConcurrentSamples = 10
 	maxParseAttempts     = 5
 	parseErrorType       = "ParseError"
+	apiErrorType         = "APIError"
 	maxFailureRate       = 0.10
 )
+
+// permanentAPIStatuses are http statuses that will fail without retry
+var permanentAPIStatuses = map[int]bool{
+	http.StatusBadRequest:   true, // 400 — malformed request
+	http.StatusUnauthorized: true, // 401 — bad credentials
+	http.StatusForbidden:    true, // 403 — not permitted
+	http.StatusNotFound:     true, // 404 — unknown model/resource
+}
 
 type CreateJobResult struct {
 	Job     EvertuneRankJob  `json:"job"`
@@ -117,7 +129,7 @@ func (s *Service) GenerateRankingActivity(ctx context.Context, sample EvertuneSa
 	for range maxParseAttempts {
 		response, err = s.genAiClient.Generate(ctx, *request)
 		if err != nil {
-			return nil, fmt.Errorf("gemini generate: %w", err)
+			return nil, classifyGenerateError(err)
 		}
 		if _, parseErr = parseRankResponse([]byte(response.Text)); parseErr == nil {
 			break
@@ -210,4 +222,14 @@ func (s *Service) buildSampleRequest(ctx context.Context, sample EvertuneSample)
 		SystemPrompt: systemPrompt,
 		Model:        string(sample.Model),
 	}, nil
+}
+
+func classifyGenerateError(err error) error {
+	var apiErr genai.APIError
+	if errors.As(err, &apiErr) && permanentAPIStatuses[apiErr.Code] {
+		return temporal.NewNonRetryableApplicationError(
+			fmt.Sprintf("gemini generate: permanent error %d", apiErr.Code), apiErrorType, err,
+		)
+	}
+	return fmt.Errorf("gemini generate: %w", err)
 }
